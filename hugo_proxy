@@ -1,0 +1,241 @@
+#!/usr/bin/python
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import mimetypes
+import socket
+import os
+import sys
+import argparse
+import subprocess
+import threading
+import logging
+import time
+
+PORT = 8000
+WORKSPACE_ID = os.environ["WORKSPACE_ID"]
+WORKSPACE_URL = f"https://www.graderthan.com/carbon/workspace/{WORKSPACE_ID}/"
+FILE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+class bcolors:
+    HEADER = "\033[95m"
+    OKBLUE = "\033[94m"
+    OKCYAN = "\033[96m"
+    OKGREEN = "\033[92m"
+    WARNING = "\033[93m"
+    FAIL = "\033[91m"
+    ENDC = "\033[0m"
+    BOLD = "\033[1m"
+    UNDERLINE = "\033[4m"
+
+
+def get_open_port():
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.bind(("", 0))
+    s.listen(1)
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+class StaticServer(BaseHTTPRequestHandler):
+    def log_message(self, format, *args):
+        color = bcolors.OKGREEN
+
+        if 400 <= int(args[1]) < 500:
+            color = bcolors.WARNING
+
+        if 500 <= int(args[1]):
+            color = bcolors.FAIL
+
+        logging.info(color + f"[{args[1]}] {args[0]}" + bcolors.ENDC)
+
+    def do_GET(self):
+
+        root = root = os.path.join(
+            FILE_DIR,
+            "website",
+            "public",
+        )
+
+        if not self.path.replace(f"/{PORT}", ""):
+            self.send_response(302)
+            self.send_header("Location", f"./{PORT}/")
+            self.end_headers()
+            return
+
+        if os.path.isdir(root + self.path):
+            file_path = root + self.path + "/index.html"
+        else:
+            file_path = root + self.path
+
+        if os.path.isfile(file_path):
+            _, file_extension = os.path.splitext(file_path)
+            content_type = mimetypes.types_map.get(file_extension)
+
+            if content_type is None:
+                self.send_response(500)
+                return
+            else:
+                self.send_response(200)
+
+            self.send_header("Content-type", content_type)
+            self.end_headers()
+
+            with open(file_path, "rb") as fh:
+                self.wfile.write(fh.read())
+        else:
+            self.send_response(404)
+
+
+class Server:
+    def __init__(self, proxy_port, hugo_directory):
+        self.stop_event = threading.Event()
+        self.http_d = None
+        self.proxy_port = proxy_port
+        self.hugo_directory = hugo_directory
+        self.hugo_processes = []
+
+    def run_forever(self):
+        """
+        Starts the server. This is a blocking function that will only return
+        when a termination signal is received.
+        """
+
+        try:
+
+            self._run_hugo()
+            self._run_proxy()
+
+        except KeyboardInterrupt:
+            self._stop()
+
+    def _stop(self):
+        logging.info("Stopping server...")
+        if self.http_d:
+            self.http_d.shutdown()
+
+        self.stop_event.set()
+        for p in self.hugo_processes:
+            p.terminate()
+            p.wait(10)
+            p.kill()
+
+        logging.info("Server terminated")
+
+    def _run_proxy(self, server_class=HTTPServer, handler_class=StaticServer):
+        """
+        Runs the reverse proxy. This is a blocking function that will not return.
+        """
+        server_address = ("", self.proxy_port)
+        self.http_d = server_class(server_address, handler_class)
+
+        print(
+            bcolors.HEADER
+            + bcolors.BOLD
+            + "Server running on: "
+            + bcolors.UNDERLINE
+            + f"{WORKSPACE_URL}{self.proxy_port}/"
+            + bcolors.ENDC
+        )
+        print("Press: CTRL-C to quit")
+        self.http_d.serve_forever()
+
+    def _run_hugo(self):
+        """
+        Starts the hugo server. The server will run in the background and render all
+        files to disk. This way the proxy can pick up the changes.
+        """
+
+        if not os.path.isdir(self.hugo_directory):
+            print(
+                bcolors.FAIL
+                + f"The directory {self.hugo_directory} does not exist"
+                + bcolors.ENDC
+            )
+            self._stop()
+            sys.exit(1)
+
+        hugo_port = get_open_port()
+
+        errors = 0
+
+        def _run():
+            nonlocal errors
+
+            while not self.stop_event.is_set():
+                now = time.time()
+                proc = subprocess.Popen(
+                    [
+                        "hugo",
+                        "server",
+                        "--baseURL",
+                        f"{WORKSPACE_URL}{self.proxy_port}/",
+                        "--appendPort=false",
+                        "--port",
+                        f"{hugo_port}",
+                        "--renderToDisk",
+                        "--disableFastRender",
+                        "--quiet",
+                    ],
+                    cwd=self.hugo_directory,
+                    stdout=subprocess.PIPE,
+                )
+
+                self.hugo_processes.append(proc)
+                proc.wait()
+                later = time.time()
+                difference = int(later - now)
+
+                if proc.returncode and difference < 10:
+                    errors += 1
+                elif proc.returncode:
+                    errors = 1
+
+                if errors > 4:
+                    self.stop_event.set()
+                    print(
+                        bcolors.FAIL
+                        + "The hugo server has failed too many times. Please check the"
+                        " logs above for the cause of the failure."
+                        + bcolors.ENDC
+                    )
+                    self._stop()
+                    sys.exit(1)
+
+        t = threading.Thread(target=_run)
+        t.start()
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        format="%(asctime)s : %(message)s",
+        level=logging.INFO,
+    ),
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "A reverse proxy for a hugo website hosted on a Grader Than"
+            " Carbon Workspace."
+        )
+    )
+
+    parser.add_argument(
+        "project_dir",
+        type=str,
+        help="The directory where the hugo project is located.",
+    )
+
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        help=f"The port number to listen on. Default is {PORT}.",
+        default=PORT,
+    )
+
+    args = parser.parse_args()
+    PORT = args.port
+
+    server = Server(PORT, args.project_dir)
+    server.run_forever()
