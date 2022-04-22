@@ -1,0 +1,49 @@
+#!/bin/bash
+
+programname=$0
+
+function usage {
+    echo "An application that creates a hugo project."
+    echo 
+    echo "ussage $programname [project_name] [theme_git_url]"
+    echo 
+    echo "project_name - The name of the root directory where the hugo project will be created."
+    echo "theme_git_url - The url to the git repo of the theme that is used."
+    exit 1
+}
+
+if [ $# == 0 ] || [ "$1" == "-h" ]; then
+    usage
+fi
+
+
+PROJECT_NAME="$1"
+GIT_REPO="$2"
+
+if [ -z "$1" ]
+then
+    echo "Please specifiy a project name."
+    exit 1
+fi
+
+if [ -z "$2" ]
+then
+    echo "Please specifiy git theme."
+    exit 1
+fi
+
+rm -rf "$PROJECT_NAME"
+
+hugo new site "$PROJECT_NAME"
+
+cd "$PROJECT_NAME"
+
+FILE_NAME=$(basename "${GIT_REPO}" | cut -d. -f1)
+git clone "${GIT_REPO}" "themes/${FILE_NAME}"
+
+if [ -d "themes/${FILE_NAME}/exampleSite/" ] 
+then
+cp -a themes/${FILE_NAME}/exampleSite/* .
+fi
+
+echo "WARNING: Please double check the theme is named \"${FILE_NAME}\" in the config file."
