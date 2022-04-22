@@ -9,11 +9,11 @@ import subprocess
 import threading
 import logging
 import time
+import tempfile
 
-PORT = 8000
+
 WORKSPACE_ID = os.environ["WORKSPACE_ID"]
 WORKSPACE_URL = f"https://www.graderthan.com/carbon/workspace/{WORKSPACE_ID}/"
-FILE_DIR = os.path.dirname(os.path.abspath(__file__))
 
 
 class bcolors:
@@ -52,22 +52,16 @@ class StaticServer(BaseHTTPRequestHandler):
 
     def do_GET(self):
 
-        root = root = os.path.join(
-            FILE_DIR,
-            "website",
-            "public",
-        )
-
-        if not self.path.replace(f"/{PORT}", ""):
+        if not self.path.replace(f"/{self.proxy_port}", ""):
             self.send_response(302)
-            self.send_header("Location", f"./{PORT}/")
+            self.send_header("Location", f"./{self.proxy_port}/")
             self.end_headers()
             return
 
-        if os.path.isdir(root + self.path):
-            file_path = root + self.path + "/index.html"
+        if os.path.isdir(self.render_dir + self.path):
+            file_path = self.render_dir + self.path + "/index.html"
         else:
-            file_path = root + self.path
+            file_path = self.render_dir + self.path
 
         if os.path.isfile(file_path):
             _, file_extension = os.path.splitext(file_path)
@@ -83,8 +77,15 @@ class StaticServer(BaseHTTPRequestHandler):
             self.end_headers()
 
             with open(file_path, "rb") as fh:
-                self.wfile.write(fh.read())
+                content = fh.read()
+                if content_type == "text/html":
+                    text = content.decode("utf-8")
+                    content = text.replace(
+                        'href="/"', f'href="{self.base_url}"'
+                    ).encode()
+                self.wfile.write(content)
         else:
+            logging.error(bcolors.FAIL + f"File not found: {file_path}" + bcolors.ENDC)
             self.send_response(404)
 
 
@@ -95,6 +96,7 @@ class Server:
         self.proxy_port = proxy_port
         self.hugo_directory = hugo_directory
         self.hugo_processes = []
+        self.render_dir = None
 
     def run_forever(self):
         """
@@ -105,13 +107,15 @@ class Server:
         try:
 
             self._run_hugo()
+            time.sleep(1)
             self._run_proxy()
 
         except KeyboardInterrupt:
             self._stop()
 
     def _stop(self):
-        logging.info("Stopping server...")
+
+        print(bcolors.OKBLUE + "Stopping server..." + bcolors.ENDC)
         if self.http_d:
             self.http_d.shutdown()
 
@@ -120,8 +124,7 @@ class Server:
             p.terminate()
             p.wait(10)
             p.kill()
-
-        logging.info("Server terminated")
+        print(bcolors.OKBLUE + "Server terminated" + bcolors.ENDC)
 
     def _run_proxy(self, server_class=HTTPServer, handler_class=StaticServer):
         """
@@ -129,6 +132,10 @@ class Server:
         """
         server_address = ("", self.proxy_port)
         self.http_d = server_class(server_address, handler_class)
+
+        self.http_d.RequestHandlerClass.render_dir = self.render_dir
+        self.http_d.RequestHandlerClass.proxy_port = self.proxy_port
+        self.http_d.RequestHandlerClass.base_url = f"{WORKSPACE_URL}{self.proxy_port}/"
 
         print(
             bcolors.HEADER
@@ -138,7 +145,7 @@ class Server:
             + f"{WORKSPACE_URL}{self.proxy_port}/"
             + bcolors.ENDC
         )
-        print("Press: CTRL-C to quit")
+        print(bcolors.OKBLUE + "Press: CTRL-C to quit" + bcolors.ENDC)
         self.http_d.serve_forever()
 
     def _run_hugo(self):
@@ -162,52 +169,60 @@ class Server:
 
         def _run():
             nonlocal errors
+            with tempfile.TemporaryDirectory() as tmp_dir:
+                self.render_dir = os.path.join(tmp_dir, "hugo_render")
 
-            while not self.stop_event.is_set():
-                now = time.time()
-                proc = subprocess.Popen(
-                    [
-                        "hugo",
-                        "server",
-                        "--baseURL",
-                        f"{WORKSPACE_URL}{self.proxy_port}/",
-                        "--appendPort=false",
-                        "--port",
-                        f"{hugo_port}",
-                        "--renderToDisk",
-                        "--disableFastRender",
-                        "--quiet",
-                    ],
-                    cwd=self.hugo_directory,
-                    stdout=subprocess.PIPE,
-                )
-
-                self.hugo_processes.append(proc)
-                proc.wait()
-                later = time.time()
-                difference = int(later - now)
-
-                if proc.returncode and difference < 10:
-                    errors += 1
-                elif proc.returncode:
-                    errors = 1
-
-                if errors > 4:
-                    self.stop_event.set()
-                    print(
-                        bcolors.FAIL
-                        + "The hugo server has failed too many times. Please check the"
-                        " logs above for the cause of the failure."
-                        + bcolors.ENDC
+                while not self.stop_event.is_set():
+                    now = time.time()
+                    proc = subprocess.Popen(
+                        [
+                            "hugo",
+                            "server",
+                            "--baseURL",
+                            f"{WORKSPACE_URL}{self.proxy_port}/",
+                            "--appendPort=false",
+                            "--port",
+                            f"{hugo_port}",
+                            "--renderToDisk",
+                            "--disableLiveReload",
+                            "--quiet",
+                            "--destination",
+                            self.render_dir,
+                            "--themesDir",
+                            "themes",
+                        ],
+                        cwd=self.hugo_directory,
+                        stdout=subprocess.PIPE,
                     )
-                    self._stop()
-                    sys.exit(1)
+
+                    self.hugo_processes.append(proc)
+                    proc.wait()
+                    later = time.time()
+                    difference = int(later - now)
+
+                    if proc.returncode and difference < 10:
+                        errors += 1
+                    elif proc.returncode:
+                        errors = 1
+
+                    if errors > 4:
+                        self.stop_event.set()
+                        print(
+                            bcolors.FAIL
+                            + "The hugo server has failed too many times. Please check"
+                            " the logs above for the cause of the failure."
+                            + bcolors.ENDC
+                        )
+                        self._stop()
+                        sys.exit(1)
 
         t = threading.Thread(target=_run)
         t.start()
 
 
 if __name__ == "__main__":
+    default_port = 8000
+
     logging.basicConfig(
         format="%(asctime)s : %(message)s",
         level=logging.INFO,
@@ -230,8 +245,8 @@ if __name__ == "__main__":
         "-p",
         "--port",
         type=int,
-        help=f"The port number to listen on. Default is {PORT}.",
-        default=PORT,
+        help=f"The port number to listen on. Default is {default_port}.",
+        default=default_port,
     )
 
     args = parser.parse_args()
